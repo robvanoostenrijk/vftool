@@ -21,12 +21,19 @@
 #include <poll.h>
 #include <util.h>
 
-#define VERSION "v0.3 10/12/2020"
+#define VERSION "v0.4 10/12/2020"
 
 #define MAX_DISCS   8
+#define MAX_SHARES  8
 
 struct disc_info {
     NSString    *path;
+    bool        readOnly;
+};
+
+struct share_info {
+    NSString    *path;
+    NSString    *tag;
     bool        readOnly;
 };
 
@@ -96,6 +103,8 @@ static VZVirtualMachineConfiguration *getVMConfig(unsigned int mem_size_mb,
                                                   NSString *initrd_path,
                                                   struct disc_info *dinfo,
                                                   unsigned int num_discs,
+                                                  struct share_info *sinfo,
+                                                  unsigned int num_shares,
                                                   NSString *bridged_eth)
 {
     /* **************************************************************** */
@@ -103,8 +112,6 @@ static VZVirtualMachineConfiguration *getVMConfig(unsigned int mem_size_mb,
      */
     NSURL *kernelURL = [NSURL fileURLWithPath:kernel_path];
     NSURL *initrdURL = nil;
-    NSURL *discURL = nil;
-    NSURL *cdromURL = nil;
 
     if (initrd_path)
         initrdURL = [NSURL fileURLWithPath:initrd_path];
@@ -129,7 +136,7 @@ static VZVirtualMachineConfiguration *getVMConfig(unsigned int mem_size_mb,
 
     /* **************************************************************** */
     // Devices
-    
+
     // Serial
     int ifd = 0, ofd = 1;
 
@@ -209,7 +216,35 @@ static VZVirtualMachineConfiguration *getVMConfig(unsigned int mem_size_mb,
     }
 
     [conf setStorageDevices:discs];
+    
+    if (@available(macOS 12.0, *)) {
+    
+        // Shared Filesystems
+        NSArray *shares = @[];
+       
+        for (unsigned int i = 0; i < num_shares; i++) {
+            NSString *share_path = sinfo[i].path;
+            NSURL *shareURL = [NSURL fileURLWithPath:share_path];
+            
+            NSLog(@"+++ Attaching directory share %@, with tag %@\n", share_path, sinfo[i].tag);
 
+            VZSharedDirectory *sharedDirectory = [[VZSharedDirectory alloc] initWithURL:shareURL readOnly:sinfo[i].readOnly];
+            
+            if (sharedDirectory) {
+                VZSingleDirectoryShare *directoryShare = [[VZSingleDirectoryShare alloc] initWithDirectory:sharedDirectory];
+                
+                if (directoryShare) {
+                    VZVirtioFileSystemDeviceConfiguration *fs_config = [[VZVirtioFileSystemDeviceConfiguration alloc] initWithTag:sinfo[i].tag];
+                    fs_config.share = directoryShare;
+
+                    shares = [shares arrayByAddingObject:fs_config];
+                }
+            }
+        }
+        
+        [conf setDirectorySharingDevices:shares];
+    }
+    
     return conf;
 }
 
@@ -224,6 +259,7 @@ static void usage(const char *me)
                     "\t-i <initrd path>\n"
                     "\t-d <disc image path>\n"
                     "\t-c <CDROM image path>            (As -d, but read-only)\n"
+                    "\t-f <shared path>:<tag>\n"
                     "\t-b <bridged ethernet interface>  (Default NAT)\n"
                     "\t-p <number of processors>        (Default 1)\n"
                     "\t-m <memory size in MB>           (Default 512MB)\n"
@@ -239,8 +275,6 @@ int main(int argc, char *argv[])
         NSString *kern_path = NULL;
         NSString *cmdline = NULL;
         NSString *initrd_path = NULL;
-        NSString *disc_path = NULL;
-        NSString *cdrom_path = NULL;
         NSString *eth_if = NULL;
         unsigned int cpus = 0;
         unsigned int mem = 0;
@@ -248,9 +282,11 @@ int main(int argc, char *argv[])
 
         struct disc_info dinfo[MAX_DISCS];
         unsigned int num_discs = 0;
+        struct share_info sinfo[MAX_SHARES];
+        unsigned int num_shares = 0;
 
         int ch;
-        while ((ch = getopt(argc, argv, "k:a:i:d:c:b:p:m:t:h")) != -1) {
+        while ((ch = getopt(argc, argv, "k:a:i:d:c:f:b:p:m:t:h")) != -1) {
             switch (ch) {
                 case 'k':
                     kern_path = [NSString stringWithUTF8String:optarg];
@@ -271,6 +307,27 @@ int main(int argc, char *argv[])
                     dinfo[num_discs].path = [NSString stringWithUTF8String:optarg];
                     dinfo[num_discs].readOnly = (ch == 'c');
                     num_discs++;
+                    break;
+                case 'f':
+                    if (@available(macOS 12.0, *)) {
+                        
+                        if (num_shares > MAX_SHARES-1) {
+                            usage(argv[0]);
+                            fprintf(stderr, "\nError: Too many shares specified (max %d)\n\n", MAX_SHARES);
+                            return 1;
+                        }
+                        
+                        NSString *shareInfo = [NSString stringWithUTF8String:optarg];
+                        NSArray *shareArray = [shareInfo componentsSeparatedByString:@":"];
+                        
+                        sinfo[num_shares].path = shareArray[0];
+                        sinfo[num_shares].tag = shareArray[1];
+                        sinfo[num_shares].readOnly = false;
+                        num_shares++;
+                    } else {
+                        fprintf(stderr, "\nError: Directory shares are only available for macOS 12 onwards.\n\n");
+                        return 1;
+                    }
                     break;
                 case 'b':
                     eth_if = [NSString stringWithUTF8String:optarg];
@@ -323,6 +380,7 @@ int main(int argc, char *argv[])
         VZVirtualMachineConfiguration *conf = getVMConfig(mem, cpus, tty_type, cmdline,
                                                           kern_path, initrd_path,
                                                           dinfo, num_discs,
+                                                          sinfo, num_shares,
                                                           eth_if);
  
         if (!conf) {
